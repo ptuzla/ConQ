@@ -1,0 +1,149 @@
+# ConQ
+ConQ is an in memory highly concurrent queue library whose specifications are defined in [InMemoryQueueLibrary.mdown] (InMemoryQueueLibrary.mdown)
+
+In addition to the specifications above, the following design decisions were made: 
+	
+ * The interface is named QueueManager and its implementation is ConcurrentQueueManager. It's a singleton object, and clients throughout the JVM access the shared instance. This choice is made so that different clients can use the same queue by just knowing the name, without having to pass references to it.
+ * The API methods are unblocking. They return null or throw Exception whenever appropriate.
+ * When a duration of `timeout` passes after a  message is `read` without any clients `dequeue`ing it, the message returns to its original state. i.e. it can't be dequeued without first being read. In this case, it's the first message that will be read next.
+i.e. it's effectively at the head of the queue abstraction.
+ * A timeout value of 0 as an argument to `read` is illegal and will raise an Exception. This is due to the fact that clients may fail to appropriately handle the message in which case the message will sit in the queue indefinitely.  
+ 
+Every test in the test directory can be executed to check the correctness and performance of the **ConQ** library.
+
+
+For convenience, class documentations for the important implementation and test classes are included below. Documentation for individual methods can be seen in their respective java files.  
+
+## ConcurrentQueueManager.java
+
+A singleton implementation of QueueManager interface.  
+Queues are created, contained and managed by this class.  
+It's the only public interface to clients that use this concurrent queue service.  
+ 
+ 
+
+## ConcurrentThreePhaseQueue.java
+
+A queue abstraction that's made of four concurrent data structures. 
+ 
+1. ConcurrentLinkedQueue : phase1 queue  
+2. ConcurrentHashMap     : phase2 map  
+3. ConcurentSkipListMap  : a time table for phase2  
+4. ConcurrentLinkedQueue : phase3 queue  
+
+### Mechanics:  
+The lifecycle of a message in **ConcurrentThreePhaseQueue** (abbr. **CTPQ**) includes three phases and their corresponding data structures
+
+**phase1:** A message enqueued to CTPQ is in phase1. It's enqueued at the tail of an internal queue named phase1 which is an instance of ConcurrentLinkedQueue
+
+**phase2:** When a message is read from phase1 queue, it's placed in a map called phase2, which is a ConcurrentHashMap. The message is now in phase2. During phase2 the messages have to be ordered according to the time they will timeout. So their headers are placed in a heap like data structure which is a ConcurrentSkipListMap. The keys to these headers consist of strings which are formed by numerically adding read time stamp and timeout of the message. This ensures that message headers are ordered according to their order in which they timeout after a read operation.  To ensure uniqueness of keys, message id is also appended to the key. The keys are lexicographically ordered in this manner. At this stage the message may be removed from phase2, which is the dequeuing of the message from CTPQ actually.
+
+**phase3:** If the timeout duration which is supplied by the read call that made the transition from phase1 to phase2 is passed, the message is enqueued to the phase3 queue, which is another ConcurrentLinkedQueue instance. The message is now in phase3.
+
+
+Messages are enqueued to phase3 queue in the order based on their timeout ages.
+i.e. The head of the phase3 queue has the message whose timeout has passed least recently, and it's to be read by
+the subsequent read calls to CTPQ first among the all messages in the phase1 queue and phase3 queue.
+
+The tail of the phase3 queue has the message whose timeout has passed most recently, and it's to be read by the subsequent read calls to CTPQ last among the all messages in the phase3 queue.
+
+All read calls to CTPQ read from phase3 first, to give the messages in phase3 precedence over those in phase1. Because they have already been at the head of the phase1 queue once, read, and placed in phase2 and left there due to failure to dequeue them at the client side.
+
+When the messages in phase3 consumed, subsequent read calls to CTPQ read from phase1 queue as long as the phase3 queue is empty.
+
+#### Maintenance:
+Before every read and dequeue operation, maintenance work takes place. This makes sure that if a message in phase2 times out after a read, it's passed to phase3 and is no longer available for a dequeue but a read.
+
+#### Concurrency:
+The four concurrent data structures that make up this queue abstraction have optimistic concurrency semantics. Their implementation in the Java collections library avoid using synchronization and utilize compare and swap functions (CAS) and algorithms. So whenever possible locking is avoided in the implementation of this class. This is so for the implementation of enqueue operation. However other api methods have to update multiple concurrent data structures atomically in order to keep them in a consistent state and use explicit locking mechanisms. So this gives this ConcurrentThreePhaseQueue class a much higher concurrency in the enqueue operation than the read and dequeue operations which have synchronized semantics.
+
+Iterators of the underlying data structures are weakly consistent, returning elements reflecting the state of the queue or map at some point at or since the creation of the iterator. They do not guarantee consistent updates to and fresh reads from the data structure. So in the implementation of CTPQ, their use is avoided.
+
+#### Time complexity:
+Enqueue operation: `O(1)`  
+Read operation: `O(1)` if no maintenance necessary. `O(log(n))` if maintenance is performed.  
+Dequeue operation: `O(log(n))`  
+ 
+
+Also, see various javadocs for the methods.
+
+
+
+## OneQueueCorrectnessTest.java
+
+This test class tests for correctness every API method that QueueManager exposes.
+It performs these tests using a single queue that's created via QueueManager.
+
+
+
+## TwoQueuesCorrectnessTest.java
+
+This test class tests for correctness every API method that QueueManager exposes.
+It performs these tests using two queues that's created via QueueManager.
+ 
+ 
+
+## IntraQueueMultiThreadTest.java
+ 
+This class tests the public API methods that are exposed by the QueueManager under high concurrency. It makes sure that the QueueManager and its underlying mechanics work correctly in a thread-safe manner under high concurrency.  
+The tests are performed in a single queue that's managed by the QueueManager.
+
+It spawns `NUM_PAIRS` number of producer threads and `NUM_PAIRS` number of consumer threads.
+
+Every thread runs `NUM_TRIALS` many times and in each run performs:
+
+1. Producer threads:  
+   a) Get a handle to the queue that's being tested  
+   b) Enqueue a message (a byte array object) to the queue
+
+2. Consumer threads:  
+   a) Get a handle to the queue that's being tested  
+   b) Read a message (a byte array object) from the queue  
+   c) Dequeue the previously read message  
+
+Total number of each type of operations performed are checked for correctness.
+
+Performance numbers are reported at the end of the test.  
+A typical output on my computer (Intel Core i7 2.2Ghz, 8 cores) is as follows:
+
+>> Performed 2250000 enqueue/read/dequeue operations with 500 threads in 4363 milliseconds  
+>> 515621 operations per second
+
+As can be seen, typical number for the total operations is around 500K per second.  
+When only enqueue operations are performed, the total number is 3 times greater.  
+i.e. around 1.5M per second.  
+This is due to the fact that no locking is used in the enqueue operation.
+
+
+
+
+## InterQueueMultiThreadTest.java
+
+This class tests the public API methods that's exposed by the QueueManager under high concurrency. It makes sure that the QueueManager and its underlying mechanics work correctly in a thread-safe manner under high concurrency.  
+The tests are performed in `NUM_THREADS` many queues *'on a one queue per thread'* basis.
+
+It spawns `NUM_THREADS` number of worker threads.
+
+Every thread performs:  
+
+1. createQueue and getQeueue operations. The queue is exclusive to this thread
+2. runs NUM_TRIALS many times the following operations:  
+   a) Enqueue a message (a byte array object) to the queue  
+   b) Read a message (a byte array object) from the queue  
+   c) Dequeue the previously read message  
+3. deleteQueue operation
+
+
+Total number of each type of operations performed are checked for correctness.
+
+Performance numbers are reported at the end of the test.  
+A typical output on my computer (Intel Core i7 2.2Ghz, 8 cores) is as follows:
+
+>> Performed 9000000 createQueue/getQueue/enquee/read/dequeue/deleteQueue operations with 500 threads in 2349 milliseconds  
+>> 3831237 operations per second
+
+As can be seen, typical number for the total operations is around 4M per second.  
+It's much higher than the number of intra queue operations that can be performed.  
+This is due to the fact that contention is avoided while every thread is working on its own queue.
+
+ 
